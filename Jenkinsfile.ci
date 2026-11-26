@@ -31,6 +31,14 @@ pipeline {
                 }
             }
         }
+
+        stage('Trigger deploy') {
+            steps {
+                build job: 'demo-app-cd',
+                    parameters: [string(name: 'VERSION', value: env.VERSION)],
+                    wait: false
+                }
+            }
     }
 
     post {

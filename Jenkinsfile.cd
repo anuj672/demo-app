@@ -31,9 +31,23 @@ pipeline {
         REGISTRY = '390403852836.dkr.ecr.us-east-1.amazonaws.com'
         IMAGE    = "${REGISTRY}/demo-app"
         AWS_DEFAULT_REGION = 'us-east-1'
+        PARAM_PREFIX = '/anujhealth/demo-app/prod'
     }
 
     stages {
+        stage('Resolve versions') {
+            steps {
+                script {
+                    withCredentials([[$class: 'AmazonWebServicesCredentialsBinding', credentialsId: 'aws-jenkins']]) {
+                        env.LAST_GOOD = sh(
+                            script: 'aws ssm get-parameter --name "$PARAM_PREFIX/current-version" --query Parameter.Value --output text',
+                            returnStdout: true
+                        ).trim()
+                    }
+                    echo "Deploying ${params.VERSION}. Last known good: ${env.LAST_GOOD}"
+                        }
+                    }
+            }
         stage('Prepare') {
             steps {
                 writeFile file: 'ssm.sh', text: '''#!/bin/bash
@@ -88,20 +102,30 @@ exit 1
                 script { ssm('health.json') }
             }
         }
+        stage('Record release') {
+            steps {
+                withCredentials([[$class: 'AmazonWebServicesCredentialsBinding', credentialsId: 'aws-jenkins']]) {
+                    sh '''
+                        aws ssm put-parameter --name "$PARAM_PREFIX/previous-version" --value "$LAST_GOOD" --type String --overwrite
+                        aws ssm put-parameter --name "$PARAM_PREFIX/current-version" --value "$VERSION" --type String --overwrite
+                    '''
+                }
+            }
+        }       
     }
 
     post {
-        failure {
+failure {
             script {
-                if (params.PREVIOUS_VERSION?.trim()) {
-                    echo "Deploy of ${params.VERSION} failed. Rolling back to ${params.PREVIOUS_VERSION}"
-                    writeFile file: 'rollback.json', text: deployJson(params.PREVIOUS_VERSION)
+                if (env.LAST_GOOD && env.LAST_GOOD != 'None' && env.LAST_GOOD != params.VERSION) {
+                    echo "Deploy of ${params.VERSION} failed. Rolling back to ${env.LAST_GOOD}"
+                    writeFile file: 'rollback.json', text: deployJson(env.LAST_GOOD)
                     ssm('rollback.json')
                     writeFile file: 'health.json', text: healthJson()
                     ssm('health.json')
-                    echo "Rolled back to ${params.PREVIOUS_VERSION} and healthy"
+                    echo "Rolled back to ${env.LAST_GOOD} and healthy"
                 } else {
-                    echo "No PREVIOUS_VERSION given. Skipping rollback."
+                    echo "No usable last-good version. Skipping rollback."
                 }
             }
         }

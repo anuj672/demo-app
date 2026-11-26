@@ -15,9 +15,15 @@ pipeline {
             }
         }
 
+        stage('Test') {
+            steps {
+                sh 'docker build --platform linux/amd64 --target test .'
+            }
+        }
+
         stage('Build') {
             steps {
-                sh 'docker build --platform linux/amd64 -t $IMAGE:$VERSION .'
+                sh 'docker build --platform linux/amd64 --target runtime -t $IMAGE:$VERSION .'
             }
         }
 

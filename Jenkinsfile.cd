@@ -1,0 +1,109 @@
+def deployJson(String version) {
+    return """{"commands":[
+      "aws ecr get-login-password --region us-east-1 | docker login --username AWS --password-stdin ${env.REGISTRY}",
+      "docker pull ${env.IMAGE}:${version}",
+      "docker rm -f demo-app || true",
+      "docker run -d --name demo-app --restart unless-stopped -p 80:8000 -e APP_VERSION=${version} ${env.IMAGE}:${version}"
+    ]}"""
+}
+
+def healthJson() {
+    return '''{"commands":[
+      "for i in $(seq 1 10); do curl -fs localhost/health && exit 0; sleep 3; done; echo HEALTHCHECK FAILED; exit 1"
+    ]}'''
+}
+
+def ssm(String file) {
+    withCredentials([[$class: 'AmazonWebServicesCredentialsBinding', credentialsId: 'aws-jenkins']]) {
+        sh "bash ssm.sh ${file}"
+    }
+}
+
+pipeline {
+    agent any
+
+    parameters {
+        string(name: 'VERSION', description: 'Image tag to deploy, e.g. 1.0.2')
+        string(name: 'PREVIOUS_VERSION', defaultValue: '', description: 'Known-good tag to roll back to (blank = no rollback)')
+    }
+
+    environment {
+        REGISTRY = '390403852836.dkr.ecr.us-east-1.amazonaws.com'
+        IMAGE    = "${REGISTRY}/demo-app"
+        AWS_DEFAULT_REGION = 'us-east-1'
+    }
+
+    stages {
+        stage('Prepare') {
+            steps {
+                writeFile file: 'ssm.sh', text: '''#!/bin/bash
+set -euo pipefail
+PARAMS_FILE="$1"
+
+CID=$(aws ssm send-command --document-name AWS-RunShellScript --targets "Key=tag:app,Values=demo" --parameters "file://$PARAMS_FILE" --query "Command.CommandId" --output text)
+echo "SSM command: $CID"
+
+IID="None"
+for i in $(seq 1 30); do
+  if [ "$IID" = "None" ] || [ -z "$IID" ]; then
+    IID=$(aws ssm list-command-invocations --command-id "$CID" --query "CommandInvocations[0].InstanceId" --output text)
+    if [ "$IID" = "None" ] || [ -z "$IID" ]; then
+      echo "Waiting for SSM to register the target..."
+      sleep 5
+      continue
+    fi
+    echo "Target instance: $IID"
+  fi
+
+  S=$(aws ssm get-command-invocation --command-id "$CID" --instance-id "$IID" --query "Status" --output text 2>&1) || true
+  echo "Status: $S"
+
+  case "$S" in
+    Success)
+      aws ssm get-command-invocation --command-id "$CID" --instance-id "$IID" --query "StandardOutputContent" --output text
+      exit 0 ;;
+    Failed|Cancelled|TimedOut)
+      aws ssm get-command-invocation --command-id "$CID" --instance-id "$IID" --query "StandardErrorContent" --output text
+      exit 1 ;;
+  esac
+  sleep 5
+done
+
+echo "Timed out waiting for SSM"
+exit 1
+'''
+            }
+        }
+
+        stage('Deploy') {
+            steps {
+                writeFile file: 'deploy.json', text: deployJson(params.VERSION)
+                script { ssm('deploy.json') }
+            }
+        }
+
+        stage('Health check') {
+            steps {
+                writeFile file: 'health.json', text: healthJson()
+                script { ssm('health.json') }
+            }
+        }
+    }
+
+    post {
+        failure {
+            script {
+                if (params.PREVIOUS_VERSION?.trim()) {
+                    echo "Deploy of ${params.VERSION} failed. Rolling back to ${params.PREVIOUS_VERSION}"
+                    writeFile file: 'rollback.json', text: deployJson(params.PREVIOUS_VERSION)
+                    ssm('rollback.json')
+                    writeFile file: 'health.json', text: healthJson()
+                    ssm('health.json')
+                    echo "Rolled back to ${params.PREVIOUS_VERSION} and healthy"
+                } else {
+                    echo "No PREVIOUS_VERSION given. Skipping rollback."
+                }
+            }
+        }
+    }
+}
